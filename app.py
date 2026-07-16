@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import io
 import re
-from typing import Optional, TypedDict
+from typing import Any, Optional, TypedDict
 
 import pandas as pd
 import plotly.express as px
@@ -84,16 +84,20 @@ EXPORT_COLUMNS: list[str] = [
     "ville_affichee",
     "date_depart",
     "duree_label",
+    "prix_barre",
     "prix_actuel",
+    "reduction_pourcentage",
 ]
 
-# Colonnes affichées à l'écran : le prix est remplacé par une version formatée
-# avec le prix normal barré (si réduction) suivi du prix actuel.
+# Colonnes affichées à l'écran : prix barré et % de réduction dans des
+# colonnes dédiées (formatées), en plus du prix actuel.
 DISPLAY_COLUMNS: list[str] = [
     "ville_affichee",
     "date_depart",
     "duree_label",
+    "prix_barre_affiche",
     "prix_affiche",
+    "reduction_affichee",
 ]
 
 DISPLAY_COLUMN_LABELS: dict[str, str] = {
@@ -104,33 +108,25 @@ DISPLAY_COLUMN_LABELS: dict[str, str] = {
     "duree_label": "Durée du séjour",
     "prix_actuel": "Prix affiché",
     "prix_affiche": "Prix affiché",
+    "prix_barre": "Prix barré",
+    "prix_barre_affiche": "Prix barré",
+    "reduction_pourcentage": "% Réduction",
+    "reduction_affichee": "% Réduction",
 }
 
-# Caractère combinant Unicode (U+0336) qui trace une ligne au-dessus de chaque
-# caractère précédent : permet un rendu "prix barré" dans une cellule texte
-# classique de st.dataframe (pas de HTML nécessaire).
-_STRIKE_COMBINING_CHAR = "\u0336"
 
-
-def _strike_text(text: str) -> str:
-    """Applique un effet visuel de texte barré à une chaîne (rendu Unicode)."""
-    return "".join(f"{char}{_STRIKE_COMBINING_CHAR}" for char in text)
-
-
-def _format_price_cell(row: pd.Series) -> str:
-    """Formate le prix affiché : prix normal barré + prix actuel si réduction."""
-    current_price = row.get("prix_actuel")
-    if pd.isna(current_price):
+def _format_euro(value: Any) -> str:
+    """Formate un prix numérique en chaîne '123 €' (ou '-' si absent)."""
+    if value is None or (isinstance(value, float) and pd.isna(value)) or pd.isna(value):
         return "-"
+    return f"{value:,.0f} €".replace(",", " ")
 
-    current_str = f"{current_price:,.0f} €".replace(",", " ")
-    normal_price = row.get("prix_normal")
 
-    if pd.notna(normal_price) and normal_price > current_price:
-        normal_str = f"{normal_price:,.0f} €".replace(",", " ")
-        return f"{_strike_text(normal_str)}  {current_str}"
-
-    return current_str
+def _format_percent(value: Any) -> str:
+    """Formate une réduction en chaîne '-12 %' (ou '-' si nulle/absente)."""
+    if value is None or pd.isna(value) or value == 0:
+        return "-"
+    return f"-{value:.0f} %"
 
 
 class SaleInfo(TypedDict):
@@ -330,9 +326,9 @@ def build_single_offer_dataframe(offer_id: str) -> pd.DataFrame:
     st.title(f"🏖️ {metadata.get('titre') or metadata.get('hotel') or 'Travel Prices'}")
 
     summary = (
-        f"**Hôtel :** {metadata.get('hotel', '-')} | "
-        f"**Destination :** {metadata.get('destination', '-')} | "
-        f"**Offres :** {result.get('total_offres', 0)}"
+        f"**Hôtel :** {metadata.get('hotel') or '-'} | "
+        f"**Destination :** {metadata.get('destination') or '-'} | "
+        f"**Disponibilités :** {result.get('total_offres', 0)}"
     )
     st.markdown(summary)
 
@@ -430,7 +426,9 @@ else:
     )
 
 df_view = df_view.loc[filter_mask].reset_index(drop=True)
-df_view["prix_affiche"] = df_view.apply(_format_price_cell, axis=1)
+df_view["prix_affiche"] = df_view["prix_actuel"].apply(_format_euro)
+df_view["prix_barre_affiche"] = df_view["prix_barre"].apply(_format_euro)
+df_view["reduction_affichee"] = df_view["reduction_pourcentage"].apply(_format_percent)
 
 table_columns = DISPLAY_COLUMNS.copy()
 export_columns = EXPORT_COLUMNS.copy()
