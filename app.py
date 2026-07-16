@@ -81,6 +81,11 @@ DISPLAY_COLUMN_LABELS: dict[str, str] = {
 }
 
 
+class SaleInfo(TypedDict):
+    titre: str
+    offer_ids: list[str]
+
+
 # ---------------------------------------------------------------------------
 # Fonctions de récupération réseau (mises en cache)
 # ---------------------------------------------------------------------------
@@ -112,9 +117,31 @@ def fetch_offer(offer_id: str) -> OfferResult:
     }
 
 
+def _extract_sale_title(soup: BeautifulSoup, sale_id: str) -> str:
+    """Tente de retrouver le nom de la vente depuis le HTML (meta og:title, h1, puis title)."""
+    og_title = soup.find("meta", attrs={"property": "og:title"})
+    if isinstance(og_title, Tag):
+        content = og_title.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+
+    h1 = soup.find("h1")
+    if isinstance(h1, Tag):
+        text = h1.get_text(strip=True)
+        if text:
+            return text
+
+    if soup.title and soup.title.string:
+        text = soup.title.string.strip()
+        if text:
+            return text
+
+    return f"Vente {sale_id}"
+
+
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_sale_offer_ids(sale_id: str) -> list[str]:
-    """Récupère la page HTML publique d'une vente et en extrait les identifiants d'offres."""
+def fetch_sale_info(sale_id: str) -> SaleInfo:
+    """Récupère la page HTML publique d'une vente : titre et identifiants d'offres."""
     url = SALE_URL_TEMPLATE.format(sale_id=sale_id)
     html_headers = {"User-Agent": DEFAULT_HEADERS["User-Agent"]}
 
@@ -125,7 +152,7 @@ def fetch_sale_offer_ids(sale_id: str) -> list[str]:
         response.raise_for_status()
     except requests.exceptions.RequestException as exc:
         st.error(f"Erreur d'accès à la vente {sale_id} : {exc}")
-        return []
+        return {"titre": f"Vente {sale_id}", "offer_ids": []}
 
     soup = BeautifulSoup(response.text, "html.parser")
     offer_ids: set[str] = set()
@@ -145,7 +172,10 @@ def fetch_sale_offer_ids(sale_id: str) -> list[str]:
         if match:
             offer_ids.add(match.group(1))
 
-    return sorted(offer_ids)
+    return {
+        "titre": _extract_sale_title(soup, sale_id),
+        "offer_ids": sorted(offer_ids),
+    }
 
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -157,13 +187,10 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 
 def enrich_display_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Ajoute les colonnes d'affichage normalisées (ville/pension) à un DataFrame."""
+    """Ajoute la colonne d'affichage normalisée (ville) à un DataFrame."""
     enriched = df.copy()
     enriched["ville_affichee"] = enriched["ville_depart_label"].fillna(
         enriched["ville_depart"]
-    )
-    enriched["pension_affichee"] = enriched["pension_label"].fillna(
-        enriched["pension"]
     )
     return enriched
 
@@ -171,7 +198,12 @@ def enrich_display_columns(df: pd.DataFrame) -> pd.DataFrame:
 def build_sale_dataframe(sale_id: str) -> pd.DataFrame:
     """Récupère et consolide les disponibilités de toutes les offres d'une vente."""
     with st.spinner(f"Scan de la vente {sale_id} pour trouver les offres..."):
-        offer_ids = fetch_sale_offer_ids(sale_id)
+        sale_info = fetch_sale_info(sale_id)
+
+    sale_title = sale_info["titre"]
+    offer_ids = sale_info["offer_ids"]
+
+    st.title(f"🏖️ {sale_title}")
 
     if not offer_ids:
         st.warning(f"Aucune offre trouvée sur la page de la vente {sale_id}.")
@@ -199,7 +231,7 @@ def build_sale_dataframe(sale_id: str) -> pd.DataFrame:
 
     consolidated = pd.concat(frames, ignore_index=True)
     st.markdown(
-        f"**Vente ID :** {sale_id} | **Offres avec données :** {len(frames)}/{len(offer_ids)} "
+        f"**Offres avec données :** {len(frames)}/{len(offer_ids)} "
         f"| **Total lignes :** {len(consolidated)}"
     )
     return consolidated
@@ -211,11 +243,14 @@ def build_single_offer_dataframe(offer_id: str) -> pd.DataFrame:
         result = fetch_offer(offer_id)
 
     if "error" in result:
+        st.title("🏖️ Travel Prices")
         st.error(f"❌ {result['error']}")
         return pd.DataFrame()
 
     availabilities = result.get("disponibilites", pd.DataFrame())
     metadata = result.get("metadata", {})
+
+    st.title(f"🏖️ {metadata.get('titre') or metadata.get('hotel') or 'Travel Prices'}")
 
     summary = (
         f"**Hôtel :** {metadata.get('hotel', '-')} | "
@@ -223,8 +258,6 @@ def build_single_offer_dataframe(offer_id: str) -> pd.DataFrame:
         f"**Offres :** {result.get('total_offres', 0)}"
     )
     st.markdown(summary)
-    if metadata.get("titre"):
-        st.caption(metadata["titre"])
 
     return availabilities if isinstance(availabilities, pd.DataFrame) else pd.DataFrame()
 
@@ -232,7 +265,7 @@ def build_single_offer_dataframe(offer_id: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Interface
 # ---------------------------------------------------------------------------
-st.title("🏖️ Travel Prices")
+st.caption("🏖️ Travel Offer Catalog Prices")
 
 query_params = st.query_params
 initial_offer_id = query_params.get("offer_id", "")
@@ -264,13 +297,14 @@ if analyze_clicked and target_id:
     if is_sale_mode:
         st.query_params["sale_id"] = target_id
         st.query_params.pop("offer_id", None)
-        fetch_sale_offer_ids.clear()
+        fetch_sale_info.clear()
     else:
         st.query_params["offer_id"] = target_id
         st.query_params.pop("sale_id", None)
         fetch_offer.clear()
 
 if not target_id:
+    st.title("🏖️ Travel Prices")
     st.info("👈 Saisissez un identifiant, ou passez `?offer_id=123` / `?sale_id=456` dans l'URL.")
     st.stop()
 
@@ -288,17 +322,21 @@ if final_df.empty:
 df_view = enrich_display_columns(final_df)
 
 villes = sorted(df_view["ville_affichee"].dropna().unique().tolist())
-pensions = sorted(
-    df_view["pension_affichee"].replace("", pd.NA).dropna().unique().tolist()
-)
 
-col_f1, col_f2 = st.columns(2)
-selected_villes = col_f1.multiselect("Villes de départ", villes, default=villes)
-selected_pensions = col_f2.multiselect("Pensions", pensions, default=pensions)
+if is_sale_mode:
+    col_f1, col_f2 = st.columns(2)
+    selected_villes = col_f1.multiselect("Villes de départ", villes, default=villes)
 
-filter_mask = df_view["ville_affichee"].isin(selected_villes) & (
-    df_view["pension_affichee"].isin(selected_pensions) | df_view["pension_affichee"].eq("")
-)
+    offres = sorted(df_view["offre_titre"].dropna().unique().tolist())
+    selected_offres = col_f2.multiselect("Offres", offres, default=offres)
+
+    filter_mask = df_view["ville_affichee"].isin(selected_villes) & df_view["offre_titre"].isin(
+        selected_offres
+    )
+else:
+    selected_villes = st.multiselect("Villes de départ", villes, default=villes)
+    filter_mask = df_view["ville_affichee"].isin(selected_villes)
+
 df_view = df_view.loc[filter_mask].reset_index(drop=True)
 
 columns_to_show = DISPLAY_COLUMNS.copy()
