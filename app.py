@@ -1,22 +1,32 @@
 """
 Travel Offer Catalog Prices
 ----------------------------
-Application Streamlit minimaliste pour analyser les disponibilités 
-et les prix d'une offre voyage SRP ou d'une vente complète.
+Application Streamlit minimaliste pour analyser les disponibilités
+et les prix d'une offre voyage SRP ou d'une vente complète (multi-offres).
 """
 from __future__ import annotations
 
 import io
 import re
-from datetime import datetime
+from typing import Optional, TypedDict
 
 import pandas as pd
 import plotly.express as px
 import requests
-from bs4 import BeautifulSoup
 import streamlit as st
+from bs4 import BeautifulSoup, Tag
 
 from data_formatter import format_availability
+
+# ---------------------------------------------------------------------------
+# Typage explicite (évite les faux positifs Pylance sur les DataFrames)
+# ---------------------------------------------------------------------------
+class OfferResult(TypedDict, total=False):
+    error: str
+    metadata: dict
+    disponibilites: pd.DataFrame
+    total_offres: int
+
 
 # ---------------------------------------------------------------------------
 # Configuration générale
@@ -27,236 +37,308 @@ st.set_page_config(
     layout="wide",
 )
 
-# Récupération des secrets
-API_URL_TEMPLATE = st.secrets.get(
-    "API_URL", 
-    "https://hiddenprod-showroomprive.orchestra-platform.com/ajax/bookingEngine/{offer_id}"
+API_URL_TEMPLATE: str = st.secrets.get(
+    "API_URL",
+    "https://hiddenprod-showroomprive.orchestra-platform.com/ajax/bookingEngine/{offer_id}",
 )
-SALE_URL_TEMPLATE = st.secrets.get(
-    "SALE_URL", 
-    "https://hiddenprod-showroomprive.orchestra-platform.com/sale?id={sale_id}"
+SALE_URL_TEMPLATE: str = st.secrets.get(
+    "SALE_URL",
+    "https://hiddenprod-showroomprive.orchestra-platform.com/sale?id={sale_id}",
 )
 
-API_USER = st.secrets.get("API_USER", "")
-API_PASSWORD = st.secrets.get("API_PASSWORD", "")
-AUTH_TUPLE = (API_USER, API_PASSWORD) if API_USER and API_PASSWORD else None
+API_USER: str = st.secrets.get("API_USER", "")
+API_PASSWORD: str = st.secrets.get("API_PASSWORD", "")
+AUTH_TUPLE: Optional[tuple[str, str]] = (
+    (API_USER, API_PASSWORD) if API_USER and API_PASSWORD else None
+)
 
-HEADERS = {
+DEFAULT_HEADERS: dict[str, str] = {
     "Accept": "application/json",
     "Accept-Charset": "utf-8",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    ),
 }
 
+REQUEST_TIMEOUT: int = 15
+CACHE_TTL: int = 300
+
+DISPLAY_COLUMNS: list[str] = [
+    "ville_affichee",
+    "date_depart",
+    "prix_actuel",
+    "reduction_pourcentage",
+    "statut",
+]
+
+
 # ---------------------------------------------------------------------------
-# Fonctions de récupération (Mises en cache)
+# Fonctions de récupération réseau (mises en cache)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_offer(offer_id: str) -> dict:
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_offer(offer_id: str) -> OfferResult:
+    """Interroge l'API booking pour une offre donnée et retourne un résultat structuré."""
     url = API_URL_TEMPLATE.format(offer_id=offer_id)
     try:
-        response = requests.get(url, headers=HEADERS, auth=AUTH_TUPLE, timeout=15)
+        response = requests.get(
+            url, headers=DEFAULT_HEADERS, auth=AUTH_TUPLE, timeout=REQUEST_TIMEOUT
+        )
         response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Erreur de connexion (Offre {offer_id}): {e}"}
+    except requests.exceptions.Timeout:
+        return {"error": f"Timeout lors de la récupération de l'offre {offer_id}."}
+    except requests.exceptions.RequestException as exc:
+        return {"error": f"Erreur de connexion (offre {offer_id}) : {exc}"}
 
     response.encoding = "utf-8"
     try:
-        return format_availability(response.json())
+        payload = response.json()
     except ValueError:
-        return {"error": f"Format invalide pour l'offre {offer_id}."}
+        return {"error": f"Réponse JSON invalide pour l'offre {offer_id}."}
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_sale_offers(sale_id: str) -> list[str]:
-    """Récupère l'HTML de la vente et extrait tous les identifiants d'offres."""
+    formatted = format_availability(payload)
+    return {
+        "metadata": formatted.get("metadata", {}),
+        "disponibilites": formatted.get("disponibilites", pd.DataFrame()),
+        "total_offres": formatted.get("total_offres", 0),
+    }
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_sale_offer_ids(sale_id: str) -> list[str]:
+    """Récupère la page HTML publique d'une vente et en extrait les identifiants d'offres."""
     url = SALE_URL_TEMPLATE.format(sale_id=sale_id)
+    html_headers = {"User-Agent": DEFAULT_HEADERS["User-Agent"]}
+
     try:
-        # On utilise un user-agent standard pour l'HTML
-        html_headers = {"User-Agent": HEADERS["User-Agent"]}
-        response = requests.get(url, headers=html_headers, auth=AUTH_TUPLE, timeout=15)
+        response = requests.get(
+            url, headers=html_headers, auth=AUTH_TUPLE, timeout=REQUEST_TIMEOUT
+        )
         response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        st.error(f"Erreur d'accès à la vente : {e}")
+    except requests.exceptions.RequestException as exc:
+        st.error(f"Erreur d'accès à la vente {sale_id} : {exc}")
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
-    offer_ids = set()
-    
-    # On cherche tous les liens <a> contenant 'offer'
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "offer" in href.lower():
-            # Cherche ?id=XXXXXX
-            match_id = re.search(r'id=(\d+)', href)
-            if match_id:
-                offer_ids.add(match_id.group(1))
-            else:
-                # Ou cherche un ID composé de 5 à 8 chiffres dans le lien
-                match_num = re.search(r'(?:/|-)(\d{5,8})(?:\b|\.|\?|/)', href)
-                if match_num:
-                    offer_ids.add(match_num.group(1))
-                    
-    return list(offer_ids)
+    offer_ids: set[str] = set()
+
+    id_in_query = re.compile(r"id=(\d+)")
+    id_in_path = re.compile(r"(?:/|-)(\d{5,8})(?:\b|\.|\?|/)")
+
+    for link in soup.find_all("a", href=True):
+        if not isinstance(link, Tag):
+            continue
+        href_value = link.get("href")
+        href = href_value if isinstance(href_value, str) else ""
+        if not href or "offer" not in href.lower():
+            continue
+
+        match = id_in_query.search(href) or id_in_path.search(href)
+        if match:
+            offer_ids.add(match.group(1))
+
+    return sorted(offer_ids)
+
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """Sérialise un DataFrame en fichier Excel (bytes) prêt au téléchargement."""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Disponibilites")
     return buffer.getvalue()
 
+
+def enrich_display_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ajoute les colonnes d'affichage normalisées (ville/pension) à un DataFrame."""
+    enriched = df.copy()
+    enriched["ville_affichee"] = enriched["ville_depart_label"].fillna(
+        enriched["ville_depart"]
+    )
+    enriched["pension_affichee"] = enriched["pension_label"].fillna(
+        enriched["pension"]
+    )
+    return enriched
+
+
+def build_sale_dataframe(sale_id: str) -> pd.DataFrame:
+    """Récupère et consolide les disponibilités de toutes les offres d'une vente."""
+    with st.spinner(f"Scan de la vente {sale_id} pour trouver les offres..."):
+        offer_ids = fetch_sale_offer_ids(sale_id)
+
+    if not offer_ids:
+        st.warning(f"Aucune offre trouvée sur la page de la vente {sale_id}.")
+        return pd.DataFrame()
+
+    st.success(f"{len(offer_ids)} offre(s) détectée(s). Récupération des prix en cours...")
+    progress_bar = st.progress(0.0)
+
+    frames: list[pd.DataFrame] = []
+    for index, offer_id in enumerate(offer_ids, start=1):
+        result = fetch_offer(offer_id)
+        availabilities = result.get("disponibilites")
+        if "error" not in result and isinstance(availabilities, pd.DataFrame) and not availabilities.empty:
+            offer_df = availabilities.copy()
+            offer_df.insert(0, "offre_titre", result.get("metadata", {}).get("titre", "-"))
+            offer_df.insert(0, "offre_id", offer_id)
+            frames.append(offer_df)
+        progress_bar.progress(index / len(offer_ids))
+
+    progress_bar.empty()
+
+    if not frames:
+        st.error("Aucune disponibilité trouvée parmi les offres de cette vente.")
+        return pd.DataFrame()
+
+    consolidated = pd.concat(frames, ignore_index=True)
+    st.markdown(
+        f"**Vente ID :** {sale_id} | **Offres avec données :** {len(frames)}/{len(offer_ids)} "
+        f"| **Total lignes :** {len(consolidated)}"
+    )
+    return consolidated
+
+
+def build_single_offer_dataframe(offer_id: str) -> pd.DataFrame:
+    """Récupère les disponibilités d'une offre unique."""
+    with st.spinner(f"Récupération des données pour l'offre {offer_id}..."):
+        result = fetch_offer(offer_id)
+
+    if "error" in result:
+        st.error(f"❌ {result['error']}")
+        return pd.DataFrame()
+
+    availabilities = result.get("disponibilites", pd.DataFrame())
+    metadata = result.get("metadata", {})
+
+    summary = (
+        f"**Hôtel :** {metadata.get('hotel', '-')} | "
+        f"**Destination :** {metadata.get('destination', '-')} | "
+        f"**Offres :** {result.get('total_offres', 0)}"
+    )
+    st.markdown(summary)
+    if metadata.get("titre"):
+        st.caption(metadata["titre"])
+
+    return availabilities if isinstance(availabilities, pd.DataFrame) else pd.DataFrame()
+
+
 # ---------------------------------------------------------------------------
-# Interface Minimaliste
+# Interface
 # ---------------------------------------------------------------------------
 st.title("🏖️ Travel Prices")
 
-# Initialisation des paramètres URL
 query_params = st.query_params
 initial_offer_id = query_params.get("offer_id", "")
 initial_sale_id = query_params.get("sale_id", "")
-if initial_sale_id:
-    initial_mode = "Toute une vente"
-else:
-    initial_mode = "Une seule offre"
+default_mode = "Toute une vente" if initial_sale_id else "Une seule offre"
 
-# Choix du mode d'analyse
 mode = st.radio(
-    "Mode d'analyse", 
-    ["Une seule offre", "Toute une vente"], 
-    horizontal=True, 
-    index=0 if initial_mode == "Une seule offre" else 1
+    "Mode d'analyse",
+    ["Une seule offre", "Toute une vente"],
+    horizontal=True,
+    index=0 if default_mode == "Une seule offre" else 1,
 )
+is_sale_mode = mode == "Toute une vente"
 
-target_id = None
-analysis_type = "offer"
-
-# Formulaire dynamique selon le mode
 col_input, col_btn = st.columns([3, 1])
 with col_input:
-    if mode == "Une seule offre":
-        input_val = st.text_input("ID de l'offre", value=initial_offer_id, placeholder="Ex: 450539", label_visibility="collapsed")
-    else:
-        input_val = st.text_input("ID de la vente", value=initial_sale_id, placeholder="Ex: 605655", label_visibility="collapsed")
-
+    placeholder = "Ex: 605655" if is_sale_mode else "Ex: 450539"
+    default_value = initial_sale_id if is_sale_mode else initial_offer_id
+    label = "ID de la vente" if is_sale_mode else "ID de l'offre"
+    input_value = st.text_input(
+        label, value=default_value, placeholder=placeholder, label_visibility="collapsed"
+    )
 with col_btn:
-    analyze_btn = st.button("Analyser", use_container_width=True, type="primary")
+    analyze_clicked = st.button("Analyser", use_container_width=True, type="primary")
 
-# Gestion du clic ou présence dans l'URL
-if analyze_btn and input_val:
-    target_id = input_val.strip()
-    if mode == "Une seule offre":
+target_id = input_value.strip()
+
+if analyze_clicked and target_id:
+    if is_sale_mode:
+        st.query_params["sale_id"] = target_id
+        st.query_params.pop("offer_id", None)
+        fetch_sale_offer_ids.clear()
+    else:
         st.query_params["offer_id"] = target_id
         st.query_params.pop("sale_id", None)
         fetch_offer.clear()
-        analysis_type = "offer"
-    else:
-        st.query_params["sale_id"] = target_id
-        st.query_params.pop("offer_id", None)
-        fetch_sale_offers.clear()
-        analysis_type = "sale"
-elif (initial_offer_id and mode == "Une seule offre") or (initial_sale_id and mode == "Toute une vente"):
-    target_id = input_val.strip()
-    analysis_type = "offer" if mode == "Une seule offre" else "sale"
 
 if not target_id:
-    st.info("👈 Saisissez un identifiant pour démarrer l'analyse.")
+    st.info("👈 Saisissez un identifiant, ou passez `?offer_id=123` / `?sale_id=456` dans l'URL.")
     st.stop()
 
 # ---------------------------------------------------------------------------
-# Récupération et Consolidation des données
+# Chargement des données selon le mode
 # ---------------------------------------------------------------------------
-final_df = pd.DataFrame()
-metadata_display = ""
-
-if analysis_type == "offer":
-    with st.spinner(f"Récupération des données pour l'offre {target_id}..."):
-        result = fetch_offer(target_id)
-        if "error" in result:
-            st.error(f"❌ {result['error']}")
-            st.stop()
-        final_df = result["disponibilites"]
-        meta = result["metadata"]
-        metadata_display = f"**Hôtel:** {meta.get('hotel', '-')} | **Destination:** {meta.get('destination', '-')} | **Offres:** {result['total_offres']}"
-        if meta.get("titre"):
-            metadata_display += f"\n\n*{meta['titre']}*"
-
-elif analysis_type == "sale":
-    with st.spinner(f"Scan de la vente {target_id} pour trouver les offres..."):
-        offer_ids = fetch_sale_offers(target_id)
-    
-    if not offer_ids:
-        st.warning(f"Aucune offre trouvée sur la page de la vente {target_id}.")
-        st.stop()
-        
-    st.success(f"{len(offer_ids)} offres détectées. Récupération des prix en cours...")
-    
-    progress_bar = st.progress(0)
-    all_dfs = []
-    
-    for i, oid in enumerate(offer_ids):
-        res = fetch_offer(oid)
-        if "error" not in res and not res["disponibilites"].empty:
-            df_offer = res["disponibilites"].copy()
-            # Ajout des colonnes de consolidation
-            df_offer.insert(0, "offre_titre", res["metadata"].get("titre", "-"))
-            df_offer.insert(0, "offre_id", oid)
-            all_dfs.append(df_offer)
-        progress_bar.progress((i + 1) / len(offer_ids))
-        
-    if not all_dfs:
-        st.error("Aucune disponibilité trouvée parmi l'ensemble des offres de la vente.")
-        st.stop()
-        
-    final_df = pd.concat(all_dfs, ignore_index=True)
-    metadata_display = f"**Vente ID:** {target_id} | **Offres récupérées:** {len(all_dfs)} sur {len(offer_ids)} | **Total dispo:** {len(final_df)}"
+final_df = build_sale_dataframe(target_id) if is_sale_mode else build_single_offer_dataframe(target_id)
 
 if final_df.empty:
-    st.warning("Aucune disponibilité trouvée.")
     st.stop()
 
-st.markdown(metadata_display)
+# ---------------------------------------------------------------------------
+# Filtres
+# ---------------------------------------------------------------------------
+df_view = enrich_display_columns(final_df)
 
-# ---------------------------------------------------------------------------
-# Filtres & Affichage
-# ---------------------------------------------------------------------------
-villes = sorted(final_df["ville_depart_label"].fillna(final_df["ville_depart"]).unique().tolist())
-pensions = sorted(final_df["pension_label"].fillna(final_df["pension"]).replace("", pd.NA).dropna().unique().tolist())
+villes = sorted(df_view["ville_affichee"].dropna().unique().tolist())
+pensions = sorted(
+    df_view["pension_affichee"].replace("", pd.NA).dropna().unique().tolist()
+)
 
 col_f1, col_f2 = st.columns(2)
-sel_villes = col_f1.multiselect("Villes de départ", villes, default=villes)
-sel_pensions = col_f2.multiselect("Pensions", pensions, default=pensions)
+selected_villes = col_f1.multiselect("Villes de départ", villes, default=villes)
+selected_pensions = col_f2.multiselect("Pensions", pensions, default=pensions)
 
-df_view = final_df.copy()
-df_view["ville_affichee"] = df_view["ville_depart_label"].fillna(df_view["ville_depart"])
-df_view["pension_affichee"] = df_view["pension_label"].fillna(df_view["pension"])
-
-mask = (
-    df_view["ville_affichee"].isin(sel_villes)
-    & (df_view["pension_affichee"].isin(sel_pensions) | df_view["pension_affichee"].eq(""))
+filter_mask = df_view["ville_affichee"].isin(selected_villes) & (
+    df_view["pension_affichee"].isin(selected_pensions) | df_view["pension_affichee"].eq("")
 )
-df_view = df_view[mask]
+df_view = df_view.loc[filter_mask].reset_index(drop=True)
 
-# Si on est sur une vente, on montre les colonnes spécifiques d'abord
-columns_to_show = ["ville_affichee", "date_depart", "prix_actuel", "reduction_pourcentage", "statut"]
-if analysis_type == "sale":
+columns_to_show = DISPLAY_COLUMNS.copy()
+if is_sale_mode:
     columns_to_show = ["offre_id", "offre_titre"] + columns_to_show
 
-tab1, tab2 = st.tabs(["Tableau", "Graphique"])
+# ---------------------------------------------------------------------------
+# Affichage : Tableau / Graphique
+# ---------------------------------------------------------------------------
+tab_table, tab_chart = st.tabs(["Tableau", "Graphique"])
 
-with tab1:
+with tab_table:
     st.dataframe(df_view[columns_to_show], use_container_width=True, hide_index=True)
-    
-    c1, c2 = st.columns(2)
-    export_name = f"vente_{target_id}" if analysis_type == "sale" else f"offre_{target_id}"
-    c1.download_button("📥 Télécharger CSV", data=df_view.to_csv(index=False).encode("utf-8-sig"), file_name=f"{export_name}.csv", use_container_width=True)
-    c2.download_button("📊 Télécharger Excel", data=to_excel_bytes(df_view), file_name=f"{export_name}.xlsx", use_container_width=True)
 
-with tab2:
-    if not df_view.empty:
-        # Dans le cas d'une vente, le graphique peut être très chargé, on groupe par date/ville (moyenne du prix) ou on met un filtre supplémentaire
-        if analysis_type == "sale":
-            st.caption("Aperçu des prix moyens par date et par ville sur l'ensemble de la vente.")
-            chart_data = df_view.groupby(["date_depart", "ville_affichee"], as_index=False)["prix_actuel"].mean()
-            fig = px.line(chart_data.sort_values("date_depart"), x="date_depart", y="prix_actuel", color="ville_affichee", markers=True)
+    export_name = f"vente_{target_id}" if is_sale_mode else f"offre_{target_id}"
+    col_csv, col_xlsx = st.columns(2)
+    col_csv.download_button(
+        "📥 Télécharger CSV",
+        data=df_view.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"{export_name}.csv",
+        use_container_width=True,
+    )
+    col_xlsx.download_button(
+        "📊 Télécharger Excel",
+        data=to_excel_bytes(df_view),
+        file_name=f"{export_name}.xlsx",
+        use_container_width=True,
+    )
+
+with tab_chart:
+    if df_view.empty:
+        st.info("Aucune donnée à afficher pour les filtres sélectionnés.")
+    else:
+        if is_sale_mode:
+            st.caption("Prix moyen par date et par ville sur l'ensemble de la vente.")
+            chart_source = (
+                df_view.groupby(["date_depart", "ville_affichee"], as_index=False)["prix_actuel"]
+                .mean()
+            )
         else:
-            fig = px.line(df_view.sort_values("date_depart"), x="date_depart", y="prix_actuel", color="ville_affichee", markers=True)
-            
+            chart_source = df_view
+
+        chart_source = chart_source.sort_values("date_depart")  # type: ignore[call-overload]
+        fig = px.line(
+            chart_source,
+            x="date_depart",
+            y="prix_actuel",
+            color="ville_affichee",
+            markers=True,
+        )
         st.plotly_chart(fig, use_container_width=True)
