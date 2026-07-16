@@ -79,6 +79,14 @@ DEFAULT_HEADERS: dict[str, str] = {
 REQUEST_TIMEOUT: int = 15
 CACHE_TTL: int = 300
 
+# Incrémenter cette valeur force l'invalidation du cache Streamlit
+# (`fetch_offer`/`fetch_sale_info`) même si leur propre code n'a pas changé,
+# par exemple après une modification du format de données dans
+# `data_formatter.py`. Sans cela, un ancien résultat (ex: sans la colonne
+# "prix_barre") peut rester en cache jusqu'à expiration du TTL et provoquer
+# un KeyError en aval.
+CACHE_FORMAT_VERSION: str = "2024-format-v2"
+
 # Colonnes exportées en CSV/Excel : valeurs numériques brutes (plus utiles en tableur).
 EXPORT_COLUMNS: list[str] = [
     "ville_affichee",
@@ -139,8 +147,12 @@ class SaleInfo(TypedDict):
 # Fonctions de récupération réseau (mises en cache)
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_offer(offer_id: str) -> OfferResult:
-    """Interroge l'API booking pour une offre donnée et retourne un résultat structuré."""
+def fetch_offer(offer_id: str, _cache_version: str = CACHE_FORMAT_VERSION) -> OfferResult:
+    """Interroge l'API booking pour une offre donnée et retourne un résultat structuré.
+
+    Le paramètre `_cache_version` ne sert qu'à invalider le cache Streamlit
+    quand le format de données change (voir `CACHE_FORMAT_VERSION`).
+    """
     url = API_URL_TEMPLATE.format(offer_id=offer_id)
     try:
         response = requests.get(
@@ -189,8 +201,12 @@ def _extract_sale_title(soup: BeautifulSoup, sale_id: str) -> str:
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_sale_info(sale_id: str) -> SaleInfo:
-    """Récupère la page HTML publique d'une vente : titre et identifiants d'offres."""
+def fetch_sale_info(sale_id: str, _cache_version: str = CACHE_FORMAT_VERSION) -> SaleInfo:
+    """Récupère la page HTML publique d'une vente : titre et identifiants d'offres.
+
+    Le paramètre `_cache_version` ne sert qu'à invalider le cache Streamlit
+    quand le format de données change (voir `CACHE_FORMAT_VERSION`).
+    """
     url = SALE_URL_TEMPLATE.format(sale_id=sale_id)
     html_headers = {"User-Agent": DEFAULT_HEADERS["User-Agent"]}
 
@@ -256,9 +272,36 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
+# Colonnes que le reste de l'application suppose toujours présentes.
+# Sert de garde-fou si un résultat mis en cache (ancienne version du code,
+# ou format API partiel) ne les contient pas encore : on les recrée à vide
+# plutôt que de planter avec un KeyError.
+_REQUIRED_COLUMNS: dict[str, Any] = {
+    "ville_depart": "",
+    "ville_depart_label": None,
+    "date_depart": pd.NaT,
+    "duree_nuits": 0,
+    "duree_label": "",
+    "prix_actuel": None,
+    "prix_normal": None,
+    "prix_barre": None,
+    "reduction_pourcentage": 0.0,
+    "offre_titre": "-",
+}
+
+
 def enrich_display_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Ajoute la colonne d'affichage normalisée (ville) à un DataFrame."""
+    """Ajoute la colonne d'affichage normalisée (ville) à un DataFrame.
+
+    Recrée aussi toute colonne manquante (ex: cache Streamlit obsolète
+    provenant d'une version antérieure de `data_formatter.py`) pour éviter
+    un KeyError en aval.
+    """
     enriched = df.copy()
+    for column, default_value in _REQUIRED_COLUMNS.items():
+        if column not in enriched.columns:
+            enriched[column] = default_value
+
     enriched["ville_affichee"] = enriched["ville_depart_label"].fillna(
         enriched["ville_depart"]
     )
