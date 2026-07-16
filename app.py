@@ -67,10 +67,18 @@ CACHE_TTL: int = 300
 DISPLAY_COLUMNS: list[str] = [
     "ville_affichee",
     "date_depart",
+    "duree_label",
     "prix_actuel",
-    "reduction_pourcentage",
-    "statut",
 ]
+
+DISPLAY_COLUMN_LABELS: dict[str, str] = {
+    "offre_id": "Offre",
+    "offre_titre": "Titre de l'offre",
+    "ville_affichee": "Ville de départ",
+    "date_depart": "Date de départ",
+    "duree_label": "Durée du séjour",
+    "prix_actuel": "Prix affiché",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -303,19 +311,20 @@ if is_sale_mode:
 tab_table, tab_chart = st.tabs(["Tableau", "Graphique"])
 
 with tab_table:
-    st.dataframe(df_view[columns_to_show], use_container_width=True, hide_index=True)
+    display_df = df_view[columns_to_show].rename(columns=DISPLAY_COLUMN_LABELS)
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     export_name = f"vente_{target_id}" if is_sale_mode else f"offre_{target_id}"
     col_csv, col_xlsx = st.columns(2)
     col_csv.download_button(
         "📥 Télécharger CSV",
-        data=df_view.to_csv(index=False).encode("utf-8-sig"),
+        data=display_df.to_csv(index=False).encode("utf-8-sig"),
         file_name=f"{export_name}.csv",
         use_container_width=True,
     )
     col_xlsx.download_button(
         "📊 Télécharger Excel",
-        data=to_excel_bytes(df_view),
+        data=to_excel_bytes(display_df),
         file_name=f"{export_name}.xlsx",
         use_container_width=True,
     )
