@@ -24,15 +24,16 @@ st.set_page_config(
     layout="wide",
 )
 
-# Récupération de l'URL via les secrets pour le déploiement sur Streamlit Cloud
-# Si non configuré dans st.secrets, on utilise l'URL par défaut.
+# Récupération des secrets pour le déploiement sécurisé
 API_URL_TEMPLATE = st.secrets.get(
     "API_URL", 
     "https://hiddenprod-showroomprive.orchestra-platform.com/ajax/bookingEngine/{offer_id}"
 )
+API_USER = st.secrets.get("API_USER", "")
+API_PASSWORD = st.secrets.get("API_PASSWORD", "")
 
 # ---------------------------------------------------------------------------
-# Appel API robuste avec cache
+# Appel API robuste avec cache et authentification
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_offer(offer_id: str) -> dict:
@@ -42,8 +43,12 @@ def fetch_offer(offer_id: str) -> dict:
         "Accept-Charset": "utf-8",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
     }
+    
+    # On prépare le tuple d'authentification s'il est configuré
+    auth_tuple = (API_USER, API_PASSWORD) if API_USER and API_PASSWORD else None
+
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(url, headers=headers, auth=auth_tuple, timeout=15)
         response.raise_for_status()
     except requests.exceptions.Timeout:
         return {"error": "Le serveur met trop de temps à répondre. Veuillez réessayer."}
@@ -58,18 +63,20 @@ def fetch_offer(offer_id: str) -> dict:
     
     return format_availability(data)
 
+
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Disponibilites")
     return buffer.getvalue()
 
+
 # ---------------------------------------------------------------------------
 # Interface Minimaliste
 # ---------------------------------------------------------------------------
 st.title("🏖️ Travel Offer Prices")
 
-# Support du paramètre GET `offer_id`
+# Support du paramètre GET `offer_id` (ex: ?offer_id=450539)
 query_params = st.query_params
 initial_offer_id = query_params.get("offer_id", "")
 
@@ -88,13 +95,14 @@ with col_btn:
 if analyze_btn and offer_id_input:
     st.query_params["offer_id"] = offer_id_input.strip()
     active_offer_id = offer_id_input.strip()
-    fetch_offer.clear() # Rafraîchissement forcé
+    fetch_offer.clear() # Rafraîchissement forcé à la demande
 else:
     active_offer_id = offer_id_input.strip()
 
 if not active_offer_id:
     st.info("👈 Saisissez un identifiant d'offre ou passez-le dans l'URL (?offer_id=123) pour démarrer l'analyse.")
     st.stop()
+
 
 # ---------------------------------------------------------------------------
 # Chargement des données
@@ -118,6 +126,7 @@ if df.empty:
 st.markdown(f"**Hôtel:** {metadata.get('hotel', '-')} | **Destination:** {metadata.get('destination', '-')} | **Offres:** {total_offres}")
 if metadata.get("titre"):
     st.caption(metadata["titre"])
+
 
 # ---------------------------------------------------------------------------
 # Filtres & Affichage (Simplifiés)
@@ -149,8 +158,18 @@ with tab1:
     )
     
     c1, c2 = st.columns(2)
-    c1.download_button("📥 CSV", data=df_view.to_csv(index=False).encode("utf-8-sig"), file_name=f"{active_offer_id}.csv", use_container_width=True)
-    c2.download_button("📊 Excel", data=to_excel_bytes(df_view), file_name=f"{active_offer_id}.xlsx", use_container_width=True)
+    c1.download_button(
+        "📥 CSV", 
+        data=df_view.to_csv(index=False).encode("utf-8-sig"), 
+        file_name=f"{active_offer_id}.csv", 
+        use_container_width=True
+    )
+    c2.download_button(
+        "📊 Excel", 
+        data=to_excel_bytes(df_view), 
+        file_name=f"{active_offer_id}.xlsx", 
+        use_container_width=True
+    )
 
 with tab2:
     if not df_view.empty:
