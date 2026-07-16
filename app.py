@@ -79,11 +79,21 @@ DEFAULT_HEADERS: dict[str, str] = {
 REQUEST_TIMEOUT: int = 15
 CACHE_TTL: int = 300
 
-DISPLAY_COLUMNS: list[str] = [
+# Colonnes exportées en CSV/Excel : valeurs numériques brutes (plus utiles en tableur).
+EXPORT_COLUMNS: list[str] = [
     "ville_affichee",
     "date_depart",
     "duree_label",
     "prix_actuel",
+]
+
+# Colonnes affichées à l'écran : le prix est remplacé par une version formatée
+# avec le prix normal barré (si réduction) suivi du prix actuel.
+DISPLAY_COLUMNS: list[str] = [
+    "ville_affichee",
+    "date_depart",
+    "duree_label",
+    "prix_affiche",
 ]
 
 DISPLAY_COLUMN_LABELS: dict[str, str] = {
@@ -93,7 +103,34 @@ DISPLAY_COLUMN_LABELS: dict[str, str] = {
     "date_depart": "Date de départ",
     "duree_label": "Durée du séjour",
     "prix_actuel": "Prix affiché",
+    "prix_affiche": "Prix affiché",
 }
+
+# Caractère combinant Unicode (U+0336) qui trace une ligne au-dessus de chaque
+# caractère précédent : permet un rendu "prix barré" dans une cellule texte
+# classique de st.dataframe (pas de HTML nécessaire).
+_STRIKE_COMBINING_CHAR = "\u0336"
+
+
+def _strike_text(text: str) -> str:
+    """Applique un effet visuel de texte barré à une chaîne (rendu Unicode)."""
+    return "".join(f"{char}{_STRIKE_COMBINING_CHAR}" for char in text)
+
+
+def _format_price_cell(row: pd.Series) -> str:
+    """Formate le prix affiché : prix normal barré + prix actuel si réduction."""
+    current_price = row.get("prix_actuel")
+    if pd.isna(current_price):
+        return "-"
+
+    current_str = f"{current_price:,.0f} €".replace(",", " ")
+    normal_price = row.get("prix_normal")
+
+    if pd.notna(normal_price) and normal_price > current_price:
+        normal_str = f"{normal_price:,.0f} €".replace(",", " ")
+        return f"{_strike_text(normal_str)}  {current_str}"
+
+    return current_str
 
 
 class SaleInfo(TypedDict):
@@ -393,10 +430,13 @@ else:
     )
 
 df_view = df_view.loc[filter_mask].reset_index(drop=True)
+df_view["prix_affiche"] = df_view.apply(_format_price_cell, axis=1)
 
-columns_to_show = DISPLAY_COLUMNS.copy()
+table_columns = DISPLAY_COLUMNS.copy()
+export_columns = EXPORT_COLUMNS.copy()
 if is_sale_mode:
-    columns_to_show = ["offre_id", "offre_titre"] + columns_to_show
+    table_columns = ["offre_id", "offre_titre"] + table_columns
+    export_columns = ["offre_id", "offre_titre"] + export_columns
 
 # ---------------------------------------------------------------------------
 # Affichage : Tableau / Graphique
@@ -404,20 +444,21 @@ if is_sale_mode:
 tab_table, tab_chart = st.tabs(["Tableau", "Graphique"])
 
 with tab_table:
-    display_df = df_view[columns_to_show].rename(columns=DISPLAY_COLUMN_LABELS)
+    display_df = df_view[table_columns].rename(columns=DISPLAY_COLUMN_LABELS)
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
+    export_df = df_view[export_columns].rename(columns=DISPLAY_COLUMN_LABELS)
     export_name = f"vente_{target_id}" if is_sale_mode else f"offre_{target_id}"
     col_csv, col_xlsx = st.columns(2)
     col_csv.download_button(
         "📥 Télécharger CSV",
-        data=display_df.to_csv(index=False).encode("utf-8-sig"),
+        data=export_df.to_csv(index=False).encode("utf-8-sig"),
         file_name=f"{export_name}.csv",
         use_container_width=True,
     )
     col_xlsx.download_button(
         "📊 Télécharger Excel",
-        data=to_excel_bytes(display_df),
+        data=to_excel_bytes(export_df),
         file_name=f"{export_name}.xlsx",
         use_container_width=True,
     )

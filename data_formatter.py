@@ -9,10 +9,38 @@ from __future__ import annotations
 
 import html
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Fuseau horaire de référence
+# ---------------------------------------------------------------------------
+# Les timestamps renvoyés par l'API (en millisecondes) représentent en réalité
+# minuit heure de Paris (Europe/Paris), mais sous forme d'epoch UTC. Une simple
+# conversion naïve (datetime.fromtimestamp sans tz) décale donc la date d'un
+# jour selon le fuseau du serveur d'exécution. On convertit systématiquement
+# en heure de Paris pour retrouver la date réellement affichée sur le site.
+PARIS_TZ = ZoneInfo("Europe/Paris")
+
+
+def _timestamp_to_paris_date(timestamp_ms: Any) -> datetime | None:
+    """Convertit un timestamp epoch (ms) en date/heure locale Europe/Paris."""
+    if timestamp_ms is None:
+        return None
+    try:
+        ts_seconds = float(timestamp_ms) / 1000
+    except (TypeError, ValueError):
+        return None
+    return datetime.fromtimestamp(ts_seconds, tz=timezone.utc).astimezone(PARIS_TZ)
+
+
+def _safe_dict(value: Any) -> dict:
+    """Retourne un dict exploitable même si la valeur d'origine est None."""
+    return value if isinstance(value, dict) else {}
+
 
 # ---------------------------------------------------------------------------
 # Nettoyage de texte (encodage / entités HTML)
@@ -86,57 +114,91 @@ def _resolve_status(day_data: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def format_availability(data: list) -> dict:
-    """Transforme la réponse brute de l'API en métadonnées + DataFrame."""
+    """Transforme la réponse brute de l'API en métadonnées + DataFrame.
+
+    Gère automatiquement les différentes variantes de réponse rencontrées
+    (offres hôtel classiques avec villes de départ, offres "Sans Transport"
+    de type camping/mobil-home, champs hotel/destination explicitement nuls,
+    etc.).
+    """
     if not data or not isinstance(data, list) or len(data) == 0:
         return {"error": "Données invalides"}
 
     offer_data = data[0]
+    if not isinstance(offer_data, dict):
+        return {"error": "Format de données inattendu"}
+
     rows: list[dict] = []
+
+    hotel_data = _safe_dict(offer_data.get("hotel"))
+    destination_data = _safe_dict(offer_data.get("destination"))
 
     metadata = {
         "titre": clean_text(offer_data.get("title", "")),
-        "destination": clean_text(offer_data.get("destination", {}).get("label", "")),
-        "hotel": clean_text(offer_data.get("hotel", {}).get("name", "")),
-        "etoiles": offer_data.get("hotel", {}).get("stars", 0),
+        "destination": clean_text(destination_data.get("label", "")),
+        "hotel": clean_text(hotel_data.get("name", "")),
+        "etoiles": hotel_data.get("stars", 0),
     }
 
-    booking_engine = offer_data.get("bookingEngine", {})
-    product = booking_engine.get("product", {})
-    if "tourOperator" in product:
+    booking_engine = _safe_dict(offer_data.get("bookingEngine"))
+    product = _safe_dict(booking_engine.get("product"))
+    tour_operator = _safe_dict(product.get("tourOperator"))
+    if tour_operator:
         metadata["tour_operator"] = {
-            "code": clean_text(product["tourOperator"].get("code", "")),
-            "label": clean_text(product["tourOperator"].get("label", "")),
+            "code": clean_text(tour_operator.get("code", "")),
+            "label": clean_text(tour_operator.get("label", "")),
         }
 
-    availabilities = booking_engine.get("availabilities", {})
+    # Correspondance code ville -> libellé lisible (ex: "XXX" -> "Sans Transport").
+    # Présente au niveau racine de la réponse pour les offres sans transport
+    # (camping, mobil-home) ; sert de repli quand departureLabel est absent.
+    city_labels = _safe_dict(offer_data.get("cities"))
+
+    availabilities = _safe_dict(booking_engine.get("availabilities"))
 
     for city_code, city_data in availabilities.items():
+        if not isinstance(city_data, dict):
+            continue
         for duration_code, month_map in city_data.items():
-            for month, day_map in month_map.items():
-                for day, day_data in day_map.items():
-                    days, nights = map(int, duration_code.split("-"))
+            if not isinstance(month_map, dict):
+                continue
+            try:
+                days, nights = map(int, duration_code.split("-"))
+            except (ValueError, AttributeError):
+                continue
 
-                    departure_date = datetime.fromtimestamp(day_data["departureDate"] / 1000)
-                    return_date = (
-                        datetime.fromtimestamp(day_data["returnDate"] / 1000)
-                        if "returnDate" in day_data
-                        else None
-                    )
+            for month, day_map in month_map.items():
+                if not isinstance(day_map, dict):
+                    continue
+                for day, day_data in day_map.items():
+                    if not isinstance(day_data, dict) or "departureDate" not in day_data:
+                        continue
+
+                    departure_date = _timestamp_to_paris_date(day_data.get("departureDate"))
+                    if departure_date is None:
+                        continue
+                    return_date = _timestamp_to_paris_date(day_data.get("returnDate"))
 
                     status = _resolve_status(day_data)
+
+                    ville_label = (
+                        clean_text(day_data.get("departureLabel"))
+                        or clean_text(city_labels.get(city_code))
+                        or clean_text(city_code)
+                    )
 
                     rows.append(
                         {
                             "ville_depart": clean_text(city_code),
-                            "ville_depart_label": clean_text(day_data.get("departureLabel", city_code)),
-                            "date_depart": departure_date,
-                            "date_retour": return_date,
+                            "ville_depart_label": ville_label,
+                            "date_depart": departure_date.replace(tzinfo=None),
+                            "date_retour": return_date.replace(tzinfo=None) if return_date else None,
                             "jour_semaine_depart": departure_date.strftime("%A"),
                             "duree_jours": days,
                             "duree_nuits": nights,
                             "duree_label": f"{days}j / {nights}n",
-                            "prix_actuel": day_data["price"],
-                            "prix_normal": day_data.get("regularPrice", day_data["price"]),
+                            "prix_actuel": day_data.get("price"),
+                            "prix_normal": day_data.get("regularPrice", day_data.get("price")),
                             "reduction_euro": day_data.get("reduction", 0),
                             "reduction_pourcentage": day_data.get("reductionRate", 0),
                             "type_chambre": clean_text(day_data.get("categoryCode", "")),
@@ -159,7 +221,7 @@ def format_availability(data: list) -> dict:
 
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values("date_depart").reset_index(drop=True)
+        df = df.dropna(subset=["prix_actuel"]).sort_values("date_depart").reset_index(drop=True)
 
     return {
         "metadata": metadata,
