@@ -37,6 +37,21 @@ st.set_page_config(
     layout="wide",
 )
 
+# CSS minimal : réduit les espaces verticaux entre les blocs Streamlit
+st.markdown(
+    """
+    <style>
+        .block-container { padding-top: 1.5rem; padding-bottom: 1rem; }
+        div[data-testid="stVerticalBlock"] > div { gap: 0.4rem; }
+        h1 { margin-bottom: 0.2rem; padding-bottom: 0; }
+        .stCaption, [data-testid="stCaptionContainer"] { margin-bottom: 0.2rem; }
+        div[data-testid="stMarkdownContainer"] p { margin-bottom: 0.2rem; }
+        div[data-testid="stProgress"] { margin-top: -0.4rem; margin-bottom: 0.4rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 API_URL_TEMPLATE: str = st.secrets.get(
     "API_URL",
     "https://hiddenprod-showroomprive.orchestra-platform.com/ajax/bookingEngine/{offer_id}",
@@ -84,6 +99,7 @@ DISPLAY_COLUMN_LABELS: dict[str, str] = {
 class SaleInfo(TypedDict):
     titre: str
     offer_ids: list[str]
+    offer_titles: dict[str, str]
 
 
 # ---------------------------------------------------------------------------
@@ -152,10 +168,11 @@ def fetch_sale_info(sale_id: str) -> SaleInfo:
         response.raise_for_status()
     except requests.exceptions.RequestException as exc:
         st.error(f"Erreur d'accès à la vente {sale_id} : {exc}")
-        return {"titre": f"Vente {sale_id}", "offer_ids": []}
+        return {"titre": f"Vente {sale_id}", "offer_ids": [], "offer_titles": {}}
 
     soup = BeautifulSoup(response.text, "html.parser")
     offer_ids: set[str] = set()
+    offer_titles: dict[str, str] = {}
 
     id_in_query = re.compile(r"id=(\d+)")
     id_in_path = re.compile(r"(?:/|-)(\d{5,8})(?:\b|\.|\?|/)")
@@ -169,12 +186,32 @@ def fetch_sale_info(sale_id: str) -> SaleInfo:
             continue
 
         match = id_in_query.search(href) or id_in_path.search(href)
-        if match:
-            offer_ids.add(match.group(1))
+        if not match:
+            continue
+        offer_id = match.group(1)
+        offer_ids.add(offer_id)
+
+        # Le titre affiché de l'offre est porté par un <h2 class="title"> à
+        # proximité du lien (dans la même carte). On remonte jusqu'à trouver
+        # un ancêtre qui contient ce tag.
+        if offer_id not in offer_titles:
+            title_tag = link.find("h2", class_="title")
+            ancestor = link
+            depth = 0
+            while title_tag is None and ancestor.parent is not None and depth < 5:
+                ancestor = ancestor.parent
+                if isinstance(ancestor, Tag):
+                    title_tag = ancestor.find("h2", class_="title")
+                depth += 1
+            if isinstance(title_tag, Tag):
+                text = title_tag.get_text(strip=True)
+                if text:
+                    offer_titles[offer_id] = text
 
     return {
         "titre": _extract_sale_title(soup, sale_id),
         "offer_ids": sorted(offer_ids),
+        "offer_titles": offer_titles,
     }
 
 
@@ -202,6 +239,7 @@ def build_sale_dataframe(sale_id: str) -> pd.DataFrame:
 
     sale_title = sale_info["titre"]
     offer_ids = sale_info["offer_ids"]
+    offer_titles = sale_info["offer_titles"]
 
     st.title(f"🏖️ {sale_title}")
 
@@ -218,7 +256,9 @@ def build_sale_dataframe(sale_id: str) -> pd.DataFrame:
         availabilities = result.get("disponibilites")
         if "error" not in result and isinstance(availabilities, pd.DataFrame) and not availabilities.empty:
             offer_df = availabilities.copy()
-            offer_df.insert(0, "offre_titre", result.get("metadata", {}).get("titre", "-"))
+            # Priorité au titre extrait de la page HTML (h2.title), sinon repli sur l'API.
+            titre = offer_titles.get(offer_id) or result.get("metadata", {}).get("titre", "-")
+            offer_df.insert(0, "offre_titre", titre)
             offer_df.insert(0, "offre_id", offer_id)
             frames.append(offer_df)
         progress_bar.progress(index / len(offer_ids))
@@ -322,20 +362,35 @@ if final_df.empty:
 df_view = enrich_display_columns(final_df)
 
 villes = sorted(df_view["ville_affichee"].dropna().unique().tolist())
+durees = (
+    df_view[["duree_nuits", "duree_label"]]
+    .dropna()
+    .drop_duplicates()
+    .sort_values("duree_nuits")["duree_label"]
+    .tolist()
+)
 
 if is_sale_mode:
-    col_f1, col_f2 = st.columns(2)
+    col_f1, col_f2, col_f3 = st.columns(3)
     selected_villes = col_f1.multiselect("Villes de départ", villes, default=villes)
+    selected_durees = col_f2.multiselect("Durée du séjour", durees, default=durees)
 
     offres = sorted(df_view["offre_titre"].dropna().unique().tolist())
-    selected_offres = col_f2.multiselect("Offres", offres, default=offres)
+    selected_offres = col_f3.multiselect("Offres", offres, default=offres)
 
-    filter_mask = df_view["ville_affichee"].isin(selected_villes) & df_view["offre_titre"].isin(
-        selected_offres
+    filter_mask = (
+        df_view["ville_affichee"].isin(selected_villes)
+        & df_view["duree_label"].isin(selected_durees)
+        & df_view["offre_titre"].isin(selected_offres)
     )
 else:
-    selected_villes = st.multiselect("Villes de départ", villes, default=villes)
-    filter_mask = df_view["ville_affichee"].isin(selected_villes)
+    col_f1, col_f2 = st.columns(2)
+    selected_villes = col_f1.multiselect("Villes de départ", villes, default=villes)
+    selected_durees = col_f2.multiselect("Durée du séjour", durees, default=durees)
+
+    filter_mask = df_view["ville_affichee"].isin(selected_villes) & df_view["duree_label"].isin(
+        selected_durees
+    )
 
 df_view = df_view.loc[filter_mask].reset_index(drop=True)
 
