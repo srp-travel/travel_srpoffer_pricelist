@@ -101,7 +101,7 @@ EXPORT_COLUMNS: list[str] = [
 # colonnes dédiées (formatées), en plus du prix actuel.
 DISPLAY_COLUMNS: list[str] = [
     "ville_affichee",
-    "date_depart",
+    "date_affichee",
     "duree_label",
     "prix_barre_affiche",
     "prix_affiche",
@@ -113,6 +113,7 @@ DISPLAY_COLUMN_LABELS: dict[str, str] = {
     "offre_titre": "Titre de l'offre",
     "ville_affichee": "Ville de départ",
     "date_depart": "Date de départ",
+    "date_affichee": "Date de départ",
     "duree_label": "Durée du séjour",
     "prix_actuel": "Prix affiché",
     "prix_affiche": "Prix affiché",
@@ -122,19 +123,53 @@ DISPLAY_COLUMN_LABELS: dict[str, str] = {
     "reduction_affichee": "% Réduction",
 }
 
+# Abréviations françaises des jours de la semaine (index = datetime.weekday()).
+_FR_WEEKDAYS: list[str] = ["Lun.", "Mar.", "Mer.", "Jeu.", "Ven.", "Sam.", "Dim."]
 
-def _format_euro(value: Any) -> str:
-    """Formate un prix numérique en chaîne '123 €' (ou '-' si absent)."""
+
+def _format_date_fr(value: Any) -> str:
+    """Formate une date en 'Jeu. 27/08/2026' (sans heure, jour abrégé en français)."""
+    if value is None or pd.isna(value):
+        return "-"
+    ts = pd.Timestamp(value)
+    return f"{_FR_WEEKDAYS[ts.weekday()]} {ts.day:02d}/{ts.month:02d}/{ts.year:04d}"
+
+
+def _column_pad_width(series: "pd.Series[Any]", decimals: int = 0) -> int:
+    """Calcule la largeur (en caractères) nécessaire pour aligner une colonne numérique.
+
+    Sert à construire des chaînes de longueur fixe (via padding par des espaces)
+    afin que le tri alphabétique du tableau Streamlit (qui trie les colonnes
+    texte caractère par caractère) coïncide avec le tri numérique réel. Sans
+    cela, "1 594 €" est trié avant "275 €" car "1" < "2" au premier caractère.
+    """
+    numeric = pd.to_numeric(series, errors="coerce").dropna()
+    if numeric.empty:
+        return 1
+    max_value = numeric.abs().max()
+    return len(f"{max_value:,.{decimals}f}".replace(",", " "))
+
+
+def _format_euro(value: Any, width: int = 1) -> str:
+    """Formate un prix en '123 €' avec un padding (espaces) garantissant un tri correct."""
     if value is None or (isinstance(value, float) and pd.isna(value)) or pd.isna(value):
         return "-"
-    return f"{value:,.0f} €".replace(",", " ")
+    padded = f"{value:,.0f}".replace(",", " ").rjust(width)
+    return f"{padded} €"
 
 
-def _format_percent(value: Any) -> str:
-    """Formate une réduction en chaîne '-12 %' (ou '-' si nulle/absente)."""
+def _format_percent(value: Any, width: int = 1) -> str:
+    """Formate une réduction en '-12 %' avec un padding (espaces) garantissant un tri correct.
+
+    Le signe '-' est purement cosmétique (indique une réduction) : il est
+    placé en position fixe pour toutes les lignes, seule la magnitude
+    (padée par des espaces) varie, ce qui préserve l'ordre numérique lors
+    du tri alphabétique du tableau.
+    """
     if value is None or pd.isna(value) or value == 0:
         return "-"
-    return f"-{value:.0f} %"
+    padded = f"{value:,.0f}".replace(",", " ").rjust(width)
+    return f"-{padded} %"
 
 
 class SaleInfo(TypedDict):
@@ -469,9 +504,22 @@ else:
     )
 
 df_view = df_view.loc[filter_mask].reset_index(drop=True)
-df_view["prix_affiche"] = df_view["prix_actuel"].apply(_format_euro)
-df_view["prix_barre_affiche"] = df_view["prix_barre"].apply(_format_euro)
-df_view["reduction_affichee"] = df_view["reduction_pourcentage"].apply(_format_percent)
+
+# Largeurs de padding calculées sur les données affichées (après filtrage) afin
+# que le tri alphabétique des colonnes texte du tableau reste numériquement
+# correct, quel que soit le nombre de chiffres des valeurs affichées.
+_price_width = max(
+    _column_pad_width(df_view["prix_actuel"]),
+    _column_pad_width(df_view["prix_barre"]),
+)
+_percent_width = _column_pad_width(df_view["reduction_pourcentage"])
+
+df_view["date_affichee"] = df_view["date_depart"].apply(_format_date_fr)
+df_view["prix_affiche"] = df_view["prix_actuel"].apply(lambda v: _format_euro(v, _price_width))
+df_view["prix_barre_affiche"] = df_view["prix_barre"].apply(lambda v: _format_euro(v, _price_width))
+df_view["reduction_affichee"] = df_view["reduction_pourcentage"].apply(
+    lambda v: _format_percent(v, _percent_width)
+)
 
 table_columns = DISPLAY_COLUMNS.copy()
 export_columns = EXPORT_COLUMNS.copy()
@@ -486,7 +534,22 @@ tab_table, tab_chart = st.tabs(["Tableau", "Graphique"])
 
 with tab_table:
     display_df = df_view[table_columns].rename(columns=DISPLAY_COLUMN_LABELS)
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    # Alignement à droite des colonnes prix/réduction : ces colonnes sont des
+    # chaînes de texte paddées par des espaces (voir _format_euro/_format_percent)
+    # pour que le tri du tableau reste numériquement correct ; l'alignement à
+    # droite masque ce padding et redonne un rendu visuel propre.
+    right_aligned = {"Prix barré", "Prix affiché", "% Réduction"}
+    column_config = {
+        col: st.column_config.TextColumn(col, alignment="right")
+        for col in display_df.columns
+        if col in right_aligned
+    }
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config=column_config,
+    )
 
     export_df = df_view[export_columns].rename(columns=DISPLAY_COLUMN_LABELS)
     export_name = f"vente_{target_id}" if is_sale_mode else f"offre_{target_id}"
