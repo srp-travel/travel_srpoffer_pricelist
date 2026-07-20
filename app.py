@@ -530,9 +530,134 @@ if is_sale_mode:
     export_columns = ["offre_id", "offre_titre"] + export_columns
 
 # ---------------------------------------------------------------------------
-# Affichage : Tableau / Graphique
+# Affichage : Rapport (par défaut) / Tableau / Graphique
 # ---------------------------------------------------------------------------
-tab_table, tab_chart = st.tabs(["Tableau", "Graphique"])
+tab_report, tab_table, tab_chart = st.tabs(["Rapport", "Tableau", "Graphique"])
+
+with tab_report:
+    if df_view.empty:
+        st.info("Aucune donnée à afficher pour les filtres sélectionnés.")
+    else:
+        # Configuration d'affichage partagée : date au format « ddd DD/MM/YYYY »
+        # (tri chronologique sur la valeur datetime sous-jacente) et prix
+        # alignés à droite (chaînes paddées → tri numérique correct).
+        _report_col_cfg: dict[str, Any] = {
+            "Date de départ": st.column_config.DatetimeColumn(
+                "Date de départ", format="ddd DD/MM/YYYY"
+            ),
+        }
+        for _c in ("Prix barré", "Prix affiché", "% Réduction", "Prix min"):
+            _report_col_cfg[_c] = st.column_config.TextColumn(_c, alignment="right")
+
+        # --- Section 1 (mode vente uniquement) : prix min par offre ---
+        if is_sale_mode:
+            st.markdown("**Prix les plus bas par offre**")
+            idx_min_offer = df_view.groupby("offre_id")["prix_actuel"].idxmin()
+            best_per_offer = (
+                df_view.loc[idx_min_offer]
+                .sort_values("prix_actuel")
+                .reset_index(drop=True)
+            )
+            _pw_o = _column_pad_width(best_per_offer["prix_actuel"])
+            best_per_offer["Prix min"] = best_per_offer["prix_actuel"].apply(
+                lambda v: _format_euro(v, _pw_o)
+            )
+            offer_cols = {
+                "offre_id": "Offre",
+                "offre_titre": "Titre de l'offre",
+                "Prix min": "Prix min",
+                "ville_affichee": "Ville de départ",
+                "date_depart": "Date de départ",
+                "duree_label": "Durée du séjour",
+            }
+            df_offer = best_per_offer[list(offer_cols.keys())].rename(columns=offer_cols)
+            st.dataframe(
+                df_offer,
+                use_container_width=True,
+                hide_index=True,
+                column_config=_report_col_cfg,
+                height=min(520, 45 + 35 * (len(df_offer) + 1)),
+            )
+            st.markdown("")
+
+        # --- Section 2 : prix min par combinaison (offre) × ville × date × durée ---
+        group_cols = ["ville_affichee", "date_depart", "duree_nuits", "duree_label"]
+        if is_sale_mode:
+            group_cols = ["offre_id", "offre_titre"] + group_cols
+
+        st.markdown(
+            "**Prix les plus bas par combinaison "
+            + ("offre × " if is_sale_mode else "")
+            + "ville × date × durée**"
+        )
+        idx_min_combo = df_view.groupby(group_cols, dropna=False)["prix_actuel"].idxmin()
+        best_per_combo = (
+            df_view.loc[idx_min_combo]
+            .sort_values(["prix_actuel"] + group_cols)
+            .reset_index(drop=True)
+        )
+        _pw_c = _column_pad_width(best_per_combo["prix_actuel"])
+        _pw_b = _column_pad_width(best_per_combo["prix_barre"])
+        _pw_r = _column_pad_width(best_per_combo["reduction_pourcentage"])
+        _pw_all = max(_pw_c, _pw_b)
+        best_per_combo["prix_affiche"] = best_per_combo["prix_actuel"].apply(
+            lambda v: _format_euro(v, _pw_all)
+        )
+        best_per_combo["prix_barre_affiche"] = best_per_combo["prix_barre"].apply(
+            lambda v: _format_euro(v, _pw_all)
+        )
+        best_per_combo["reduction_affichee"] = best_per_combo["reduction_pourcentage"].apply(
+            lambda v: _format_percent(v, _pw_r)
+        )
+        combo_display_cols = (
+            (["offre_id", "offre_titre"] if is_sale_mode else [])
+            + [
+                "ville_affichee",
+                "date_depart",
+                "duree_label",
+                "prix_barre_affiche",
+                "prix_affiche",
+                "reduction_affichee",
+            ]
+        )
+        df_combo = best_per_combo[combo_display_cols].rename(columns=DISPLAY_COLUMN_LABELS)
+        st.dataframe(
+            df_combo,
+            use_container_width=True,
+            hide_index=True,
+            column_config=_report_col_cfg,
+            height=520,
+        )
+
+        # Export du rapport (combinaisons min uniquement, valeurs numériques brutes)
+        combo_export_cols = (
+            (["offre_id", "offre_titre"] if is_sale_mode else [])
+            + [
+                "ville_affichee",
+                "date_depart",
+                "duree_label",
+                "prix_barre",
+                "prix_actuel",
+                "reduction_pourcentage",
+            ]
+        )
+        export_report = best_per_combo[combo_export_cols].rename(columns=DISPLAY_COLUMN_LABELS)
+        report_name = f"rapport_{'vente' if is_sale_mode else 'offre'}_{target_id}"
+        col_r_csv, col_r_xlsx = st.columns(2)
+        col_r_csv.download_button(
+            "📥 Rapport CSV",
+            data=export_report.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{report_name}.csv",
+            use_container_width=True,
+            key="dl_report_csv",
+        )
+        col_r_xlsx.download_button(
+            "📊 Rapport Excel",
+            data=to_excel_bytes(export_report),
+            file_name=f"{report_name}.xlsx",
+            use_container_width=True,
+            key="dl_report_xlsx",
+        )
 
 with tab_table:
     display_df = df_view[table_columns].rename(columns=DISPLAY_COLUMN_LABELS)
