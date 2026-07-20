@@ -37,16 +37,27 @@ st.set_page_config(
     layout="wide",
 )
 
-# CSS minimal : réduit les espaces verticaux entre les blocs Streamlit
+# CSS compact : réduit fortement les espaces verticaux entre les blocs Streamlit
 st.markdown(
     """
     <style>
-        .block-container { padding-top: 1.5rem; padding-bottom: 1rem; }
-        div[data-testid="stVerticalBlock"] > div { gap: 0.4rem; }
-        h1 { margin-bottom: 0.2rem; padding-bottom: 0; }
-        .stCaption, [data-testid="stCaptionContainer"] { margin-bottom: 0.2rem; }
-        div[data-testid="stMarkdownContainer"] p { margin-bottom: 0.2rem; }
+        .block-container { padding-top: 0.6rem; padding-bottom: 0.6rem; max-width: 100%; }
+        div[data-testid="stVerticalBlock"] > div { gap: 0.25rem; }
+        h1 { margin-bottom: 0.1rem; padding-bottom: 0; font-size: 1.6rem; }
+        h2, h3 { margin-top: 0.2rem; margin-bottom: 0.2rem; }
+        .stCaption, [data-testid="stCaptionContainer"] { margin-bottom: 0.1rem; margin-top: 0; }
+        div[data-testid="stMarkdownContainer"] p { margin-bottom: 0.1rem; }
         div[data-testid="stProgress"] { margin-top: -0.4rem; margin-bottom: 0.4rem; }
+        /* Radios / multiselects / inputs plus compacts */
+        div[data-testid="stRadio"] > label,
+        div[data-testid="stMultiSelect"] > label,
+        div[data-testid="stTextInput"] > label { margin-bottom: 0.05rem; font-size: 0.85rem; }
+        div[data-testid="stRadio"] { margin-bottom: 0.1rem; }
+        div[data-baseweb="select"] { min-height: 32px; }
+        /* Onglets plus compacts */
+        button[data-baseweb="tab"] { padding-top: 0.25rem; padding-bottom: 0.25rem; }
+        /* Tableau : lignes plus denses */
+        div[data-testid="stDataFrame"] { margin-top: 0.25rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -97,11 +108,12 @@ EXPORT_COLUMNS: list[str] = [
     "reduction_pourcentage",
 ]
 
-# Colonnes affichées à l'écran : prix barré et % de réduction dans des
-# colonnes dédiées (formatées), en plus du prix actuel.
+# Colonnes affichées à l'écran : `date_depart` reste en type datetime pour que
+# le tri du tableau Streamlit s'effectue sur les dates réelles (et pas sur du
+# texte). Le format d'affichage est piloté via `st.column_config.DatetimeColumn`.
 DISPLAY_COLUMNS: list[str] = [
     "ville_affichee",
-    "date_affichee",
+    "date_depart",
     "duree_label",
     "prix_barre_affiche",
     "prix_affiche",
@@ -122,18 +134,6 @@ DISPLAY_COLUMN_LABELS: dict[str, str] = {
     "reduction_pourcentage": "% Réduction",
     "reduction_affichee": "% Réduction",
 }
-
-# Abréviations françaises des jours de la semaine (index = datetime.weekday()).
-_FR_WEEKDAYS: list[str] = ["Lun.", "Mar.", "Mer.", "Jeu.", "Ven.", "Sam.", "Dim."]
-
-
-def _format_date_fr(value: Any) -> str:
-    """Formate une date en 'Jeu. 27/08/2026' (sans heure, jour abrégé en français)."""
-    if value is None or pd.isna(value):
-        return "-"
-    ts = pd.Timestamp(value)
-    return f"{_FR_WEEKDAYS[ts.weekday()]} {ts.day:02d}/{ts.month:02d}/{ts.year:04d}"
-
 
 def _column_pad_width(series: "pd.Series[Any]", decimals: int = 0) -> int:
     """Calcule la largeur (en caractères) nécessaire pour aligner une colonne numérique.
@@ -416,28 +416,28 @@ def build_single_offer_dataframe(offer_id: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Interface
 # ---------------------------------------------------------------------------
-st.caption("🏖️ Travel Offer Catalog Prices")
-
 query_params = st.query_params
 initial_offer_id = query_params.get("offer_id", "")
 initial_sale_id = query_params.get("sale_id", "")
 default_mode = "Toute une vente" if initial_sale_id else "Une seule offre"
 
-mode = st.radio(
-    "Mode d'analyse",
-    ["Une seule offre", "Toute une vente"],
-    horizontal=True,
-    index=0 if default_mode == "Une seule offre" else 1,
-)
+# Barre d'entrée compacte : mode + ID + bouton sur une seule ligne.
+col_mode, col_input, col_btn = st.columns([2, 3, 1])
+with col_mode:
+    mode = st.radio(
+        "Mode",
+        ["Une seule offre", "Toute une vente"],
+        horizontal=True,
+        index=0 if default_mode == "Une seule offre" else 1,
+        label_visibility="collapsed",
+    )
 is_sale_mode = mode == "Toute une vente"
 
-col_input, col_btn = st.columns([3, 1])
 with col_input:
-    placeholder = "Ex: 605655" if is_sale_mode else "Ex: 450539"
+    placeholder = "ID vente (ex: 605655)" if is_sale_mode else "ID offre (ex: 450539)"
     default_value = initial_sale_id if is_sale_mode else initial_offer_id
-    label = "ID de la vente" if is_sale_mode else "ID de l'offre"
     input_value = st.text_input(
-        label, value=default_value, placeholder=placeholder, label_visibility="collapsed"
+        "ID", value=default_value, placeholder=placeholder, label_visibility="collapsed"
     )
 with col_btn:
     analyze_clicked = st.button("Analyser", use_container_width=True, type="primary")
@@ -514,7 +514,9 @@ _price_width = max(
 )
 _percent_width = _column_pad_width(df_view["reduction_pourcentage"])
 
-df_view["date_affichee"] = df_view["date_depart"].apply(_format_date_fr)
+# `date_depart` reste en type datetime (nécessaire au tri chronologique
+# du tableau Streamlit) ; le format d'affichage est géré via column_config.
+df_view["date_depart"] = pd.to_datetime(df_view["date_depart"], errors="coerce")
 df_view["prix_affiche"] = df_view["prix_actuel"].apply(lambda v: _format_euro(v, _price_width))
 df_view["prix_barre_affiche"] = df_view["prix_barre"].apply(lambda v: _format_euro(v, _price_width))
 df_view["reduction_affichee"] = df_view["reduction_pourcentage"].apply(
@@ -539,16 +541,25 @@ with tab_table:
     # pour que le tri du tableau reste numériquement correct ; l'alignement à
     # droite masque ce padding et redonne un rendu visuel propre.
     right_aligned = {"Prix barré", "Prix affiché", "% Réduction"}
-    column_config = {
+    column_config: dict[str, Any] = {
         col: st.column_config.TextColumn(col, alignment="right")
         for col in display_df.columns
         if col in right_aligned
     }
+    # Colonne date : sur type datetime, avec format « ddd DD/MM/YYYY »
+    # (jour abrégé + date), sans heure. Le tri s'effectue sur la valeur
+    # datetime sous-jacente, donc chronologiquement.
+    if "Date de départ" in display_df.columns:
+        column_config["Date de départ"] = st.column_config.DatetimeColumn(
+            "Date de départ",
+            format="ddd DD/MM/YYYY",
+        )
     st.dataframe(
         display_df,
         use_container_width=True,
         hide_index=True,
         column_config=column_config,
+        height=520,
     )
 
     export_df = df_view[export_columns].rename(columns=DISPLAY_COLUMN_LABELS)
