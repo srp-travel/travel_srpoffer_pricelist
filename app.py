@@ -41,7 +41,11 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-        .block-container { padding-top: 0.6rem; padding-bottom: 0.6rem; max-width: 100%; }
+        /* padding-top suffisant pour passer sous le header fixe de Streamlit
+           (toolbar Share / étoile / GitHub / ⋮ ≈ 2.9rem de hauteur). */
+        .block-container { padding-top: 3.2rem; padding-bottom: 0.6rem; max-width: 100%; }
+        /* Rend le header Streamlit semi-transparent pour ne pas masquer visuellement. */
+        header[data-testid="stHeader"] { background: rgba(255,255,255,0.75); backdrop-filter: blur(4px); }
         div[data-testid="stVerticalBlock"] > div { gap: 0.25rem; }
         h1 { margin-bottom: 0.1rem; padding-bottom: 0; font-size: 1.6rem; }
         h2, h3 { margin-top: 0.2rem; margin-bottom: 0.2rem; }
