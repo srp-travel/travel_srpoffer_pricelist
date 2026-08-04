@@ -93,7 +93,8 @@ DEFAULT_HEADERS: dict[str, str] = {
 
 REQUEST_TIMEOUT: int = 15
 CACHE_TTL: int = 120
-CACHE_MAX_ENTRIES: int = 128
+CACHE_MAX_ENTRIES: int = 32
+MAX_SALE_OFFERS: int = 50
 
 # Incrémenter cette valeur force l'invalidation du cache Streamlit
 # (`fetch_offer`/`fetch_sale_info`) même si leur propre code n'a pas changé,
@@ -184,14 +185,15 @@ class SaleInfo(TypedDict):
 
 
 # ---------------------------------------------------------------------------
-# Fonctions de récupération réseau (mises en cache)
+# Fonctions de récupération réseau
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=CACHE_TTL, max_entries=CACHE_MAX_ENTRIES, show_spinner=False)
 def fetch_offer(offer_id: str, _cache_version: str = CACHE_FORMAT_VERSION) -> OfferResult:
     """Interroge l'API booking pour une offre donnée et retourne un résultat structuré.
 
-    Le paramètre `_cache_version` ne sert qu'à invalider le cache Streamlit
-    quand le format de données change (voir `CACHE_FORMAT_VERSION`).
+    Le résultat n'est pas mis en cache côté Streamlit : sur Community Cloud,
+    cette couche stocke des DataFrames complets en mémoire, ce qui peut faire
+    monter fortement l'empreinte RAM pour les ventes volumineuses. On garde
+    seulement le cache de la page de vente (titre + IDs), plus léger.
     """
     url = API_URL_TEMPLATE.format(offer_id=offer_id)
     try:
@@ -363,10 +365,18 @@ def build_sale_dataframe(sale_id: str) -> pd.DataFrame:
         st.warning(f"Aucune offre trouvée sur la page de la vente {sale_id}.")
         return pd.DataFrame()
 
+    if len(offer_ids) > MAX_SALE_OFFERS:
+        st.warning(
+            f"La vente contient {len(offer_ids)} offres. Pour rester dans les limites "
+            f"de mémoire du Cloud, seules les {MAX_SALE_OFFERS} premières offres sont "
+            f"analysées pour cette requête."
+        )
+        offer_ids = offer_ids[:MAX_SALE_OFFERS]
+
     st.success(f"{len(offer_ids)} offre(s) détectée(s). Récupération des prix en cours...")
     progress_bar = st.progress(0.0)
 
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[Any, Any]] = []
     offers_with_data = 0
     for index, offer_id in enumerate(offer_ids, start=1):
         result = fetch_offer(offer_id)
@@ -459,7 +469,6 @@ if analyze_clicked and target_id:
     else:
         st.query_params["offer_id"] = target_id
         st.query_params.pop("sale_id", None)
-        fetch_offer.clear()
 
 if not target_id:
     st.title("🏖️ Travel Prices")
