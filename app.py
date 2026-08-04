@@ -92,7 +92,8 @@ DEFAULT_HEADERS: dict[str, str] = {
 }
 
 REQUEST_TIMEOUT: int = 15
-CACHE_TTL: int = 300
+CACHE_TTL: int = 120
+CACHE_MAX_ENTRIES: int = 128
 
 # Incrémenter cette valeur force l'invalidation du cache Streamlit
 # (`fetch_offer`/`fetch_sale_info`) même si leur propre code n'a pas changé,
@@ -185,7 +186,7 @@ class SaleInfo(TypedDict):
 # ---------------------------------------------------------------------------
 # Fonctions de récupération réseau (mises en cache)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL, max_entries=CACHE_MAX_ENTRIES, show_spinner=False)
 def fetch_offer(offer_id: str, _cache_version: str = CACHE_FORMAT_VERSION) -> OfferResult:
     """Interroge l'API booking pour une offre donnée et retourne un résultat structuré.
 
@@ -239,7 +240,7 @@ def _extract_sale_title(soup: BeautifulSoup, sale_id: str) -> str:
     return f"Vente {sale_id}"
 
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL, max_entries=CACHE_MAX_ENTRIES, show_spinner=False)
 def fetch_sale_info(sale_id: str, _cache_version: str = CACHE_FORMAT_VERSION) -> SaleInfo:
     """Récupère la page HTML publique d'une vente : titre et identifiants d'offres.
 
@@ -365,7 +366,8 @@ def build_sale_dataframe(sale_id: str) -> pd.DataFrame:
     st.success(f"{len(offer_ids)} offre(s) détectée(s). Récupération des prix en cours...")
     progress_bar = st.progress(0.0)
 
-    frames: list[pd.DataFrame] = []
+    rows: list[dict[str, Any]] = []
+    offers_with_data = 0
     for index, offer_id in enumerate(offer_ids, start=1):
         result = fetch_offer(offer_id)
         availabilities = result.get("disponibilites")
@@ -375,18 +377,19 @@ def build_sale_dataframe(sale_id: str) -> pd.DataFrame:
             titre = offer_titles.get(offer_id) or result.get("metadata", {}).get("titre", "-")
             offer_df.insert(0, "offre_titre", titre)
             offer_df.insert(0, "offre_id", offer_id)
-            frames.append(offer_df)
+            rows.extend(offer_df.to_dict(orient="records"))
+            offers_with_data += 1
         progress_bar.progress(index / len(offer_ids))
 
     progress_bar.empty()
 
-    if not frames:
+    if not rows:
         st.error("Aucune disponibilité trouvée parmi les offres de cette vente.")
         return pd.DataFrame()
 
-    consolidated = pd.concat(frames, ignore_index=True)
+    consolidated = pd.DataFrame.from_records(rows)
     st.markdown(
-        f"**Offres avec données :** {len(frames)}/{len(offer_ids)} "
+        f"**Offres avec données :** {offers_with_data}/{len(offer_ids)} "
         f"| **Total lignes :** {len(consolidated)}"
     )
     return consolidated
